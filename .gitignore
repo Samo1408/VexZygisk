@@ -1,0 +1,7 @@
+.clangd
+.clang-format
+.idea
+.vscode
+build
+# INFO: The APatch flavour builds into its own tree (FLAVOR_DIR=-apatch).
+build-apatch

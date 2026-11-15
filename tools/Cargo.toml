@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = ["."]
+
+# The build tools that used to be Python scripts, plus the two things that run
+# on the device. The device-side bins carry a `required-features` marker so a
+# plain `cargo build` or `cargo test` here builds only what a workstation can
+# link; `device-target.sh` is what builds the rest, and it is the only thing
+# that does - see the note on the tracer below for what happens otherwise.
+[package]
+name = "vex-tools"
+version = "2.2.0"
+edition = "2021"
+rust-version = "1.75"
+description = "VexZygisk build tools and tracer CLI"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "vex_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ci-size-budget"
+path = "src/bin/ci_size_budget.rs"
+
+[[bin]]
+name = "make-update-json"
+path = "src/bin/make_update_json.rs"
+
+[[bin]]
+name = "sign"
+path = "src/bin/sign.rs"
+
+# The host test suite's helpers. These replace the Python scripts under
+# tests/host/ and loader/src/injector/, and they run in CI on every build.
+[[bin]]
+name = "gen-jni-hooks"
+path = "src/bin/gen_jni_hooks.rs"
+
+[[bin]]
+name = "check-generated"
+path = "src/bin/check_generated.rs"
+
+[[bin]]
+name = "check-protocol"
+path = "src/bin/check_protocol.rs"
+
+[[bin]]
+name = "make-debugdata"
+path = "src/bin/make_debugdata.rs"
+
+# The tracer CLI is the front end of the C engine and is linked into the same
+# shared object as it, so it cannot be built for the host: every symbol it calls
+# lives in the Android build. The `android` feature is what the NDK build turns
+# on, and it is off by default so `cargo test` and `cargo build` on a
+# workstation keep working.
+#
+# `tools/device-target.sh` is what turns it on, and it is the only thing that
+# ever compiles this bin - it lived here for a while without anything building
+# it, and rotted: by the time it was wired up, `zeroed()` had become an error
+# and the doc comment on the `extern` block had stopped being legal. Anything
+# added here for the device needs the same treatment, or it will do it again.
+[[bin]]
+name = "zygisk-ptrace64"
+path = "src/bin/zygisk_ptrace64.rs"
+required-features = ["android"]
+
+# The two halves of the size probe, one linked against std and one no_std. They
+# exist to produce a number, not to run: `device-target.sh` builds them for the
+# device target and prints the result next to the CI size budgets, so the
+# question "does Rust fit in this budget" is answered by measurement rather
+# than by argument. Off by default, so neither the host build nor the test run
+# sees them.
+[[bin]]
+name = "probe-std"
+path = "src/bin/probe_std.rs"
+required-features = ["probe"]
+
+[[bin]]
+name = "probe-no-std"
+path = "src/bin/probe_no_std.rs"
+required-features = ["probe"]
+
+[features]
+default = []
+android = []
+probe = []
+
+[dependencies]
+# Host tools only. Kept deliberately small: every dependency is something the
+# Python scripts did with the standard library or with `cryptography`.
+# Both are no_std-friendly so the same lockfile works for the Android build.
+sha2 = { version = "0.10", default-features = false }
+ed25519-compact = { version = "2", default-features = false, features = ["traits"] }
+# XZ for the .gnu_debugdata fixture. The obvious alternative, xz2, is a binding
+# to liblzma and needs a C compiler to build; this one is pure Rust, which keeps
+# `cargo build` working with nothing but a Rust toolchain installed.
+lzma-rs = "0.3"
+
+[profile.release]
+# The tools ship inside CI, so a small binary is worth more than a fast one.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

@@ -1,0 +1,359 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <unistd.h>
+
+#include "../utils.h"
+#include "apatch.h"
+
+/* INFO: APatch (https://github.com/bmax121/APatch) is a KernelPatch based root
+         solution. Its per-package policy lives in /data/adb/ap/package_config, a
+         CSV with the header pkg,exclude,allow,uid,to_uid,sctx. The kernel keys
+         both lists by the uid alone, and a work profile is a row of its own that
+         carries that profile's user offset, so a row is matched by its uid
+         exactly; to_uid is the uid a granted process switches to, never a bound
+         of a range. The manager is me.bmax.apatch, and FolkPatch (an APatch
+         branch) ships its own as me.yuki.folk. Kernel-side authorization goes
+         through the KernelPatch supercall interface and is not touched here. */
+#define AP_BIN_DIR "/data/adb/ap/bin/apd"
+#define AP_CONFIG_FILE "/data/adb/ap/package_config"
+#define AP_MANAGER_PKG "me.bmax.apatch"
+#define AP_FOLKPATCH_PKG "me.yuki.folk"
+
+/* INFO: Bounded because the file is walked for every process flag query; a grant
+         that does not fit is not one this daemon can serve anyway. */
+#define AP_MAX_ROWS 256
+#define AP_PKG_NAME_MAX 255
+
+struct ap_package_entry {
+  char pkg[AP_PKG_NAME_MAX + 1];
+  bool exclude;
+  bool allow;
+  uid_t uid;
+};
+
+/* INFO: One CSV line may quote its fields ("a""b" is a literal quote inside a
+         quoted field, RFC 4180). The fields are written back into out_fields
+         as NUL-terminated strings. Returns the number of fields parsed, at
+         most max_fields. */
+static size_t ap_parse_csv_line(const char *line, char out_fields[][AP_PKG_NAME_MAX + 1], size_t max_fields) {
+  size_t field_count = 0;
+  size_t field_len = 0;
+  bool in_quotes = false;
+
+  while (*line != '\0' && *line != '\n' && *line != '\r') {
+    char c = *line++;
+
+    if (c == '"') {
+      if (in_quotes && *line == '"') {
+        if (field_len < AP_PKG_NAME_MAX) out_fields[field_count][field_len++] = '"';
+
+        line++;
+      } else {
+        in_quotes = !in_quotes;
+      }
+
+      continue;
+    }
+
+    if (c == ',' && !in_quotes) {
+      out_fields[field_count][field_len] = '\0';
+      field_count++;
+      field_len = 0;
+
+      if (field_count >= max_fields) break;
+
+      continue;
+    }
+
+    if (field_len < AP_PKG_NAME_MAX) out_fields[field_count][field_len++] = c;
+  }
+
+  if (field_count < max_fields) {
+    out_fields[field_count][field_len] = '\0';
+    field_count++;
+  }
+
+  return field_count;
+}
+
+static bool ap_parse_bool_field(const char *field) {
+  return strcmp(field, "1") == 0;
+}
+
+/* INFO: Reads the package configuration. The file is rewritten atomically
+         (tmp + rename), so a reader sees either the old or the new file and no
+         retry sleep is needed — the previous 1s x 5 retry ran inside
+         GetProcessFlags, stalling every zygote fork behind it for up to five
+         seconds. Returns the number of rows parsed. */
+static size_t ap_read_package_config(struct ap_package_entry *out, size_t max_rows) {
+  FILE *file = fopen(AP_CONFIG_FILE, "re");
+  if (file == NULL) {
+    LOGE("Failed opening %s: %s", AP_CONFIG_FILE, strerror(errno));
+
+    return 0;
+  }
+
+  size_t rows = 0;
+
+  char line[1024];
+  size_t line_number = 0;
+
+  while (fgets(line, sizeof(line), file) != NULL) {
+    line_number++;
+
+    /* INFO: The first line is the header. */
+    if (line_number == 1) continue;
+
+    char fields[6][AP_PKG_NAME_MAX + 1];
+    size_t field_count = ap_parse_csv_line(line, fields, 6);
+    if (field_count < 6) continue;
+
+    char *endptr = NULL;
+    long exclude = strtol(fields[1], &endptr, 10);
+    if (*endptr != '\0') continue;
+
+    endptr = NULL;
+    long allow = strtol(fields[2], &endptr, 10);
+    if (*endptr != '\0') continue;
+
+    /* INFO: The numeric columns were only validated above, the boolean
+              value is re-read from the raw field. */
+    (void) exclude;
+    (void) allow;
+
+    endptr = NULL;
+    long long uid = strtoll(fields[3], &endptr, 10);
+    if (*endptr != '\0' || uid < 0 || uid > (long long)UINT_MAX) continue;
+
+    endptr = NULL;
+    long long to_uid = strtoll(fields[4], &endptr, 10);
+    if (*endptr != '\0' || to_uid < 0 || to_uid > (long long)UINT_MAX) continue;
+
+    /* INFO: Validated, then dropped: the kernel discards a row whose to_uid it
+              cannot read, so a row it refused must not be answered as a grant. */
+    (void) to_uid;
+
+    if (fields[0][0] == '\0' || rows >= max_rows) continue;
+
+    struct ap_package_entry *entry = &out[rows];
+
+    strncpy(entry->pkg, fields[0], AP_PKG_NAME_MAX);
+    entry->pkg[AP_PKG_NAME_MAX] = '\0';
+    entry->exclude = ap_parse_bool_field(fields[1]);
+    entry->allow = ap_parse_bool_field(fields[2]);
+    entry->uid = (uid_t)uid;
+
+    rows++;
+  }
+
+  fclose(file);
+
+  return rows;
+}
+
+/* INFO: This file is walked for every process flag query, that is, for every
+         fork off zygote. The parsed rows are cached and the cache is
+         invalidated on the file's stat identity, so a grant takes effect as
+         soon as APatch rewrites the config (which lands on a fresh inode via
+         tmp + rename). The stat of the parsed file is kept as the call returned
+         it and compared field by field, so no field is read back through a
+         narrower type than the one it was stored as. The daemon serves one
+         request at a time, so the cache needs no lock. */
+struct ap_config_cache {
+  bool valid;
+  struct stat stat;
+
+  struct ap_package_entry entries[AP_MAX_ROWS];
+  size_t rows;
+};
+
+static struct ap_config_cache ap_config_cache;
+
+static struct ap_package_entry *ap_get_config_rows(size_t *rows) {
+  struct stat st;
+  if (stat(AP_CONFIG_FILE, &st) == -1) {
+    /* INFO: The file being gone is a real change; anything else is likely a
+              hiccup, so the last known rows stay usable. */
+    if (errno == ENOENT) {
+      ap_config_cache.valid = false;
+      ap_config_cache.rows = 0;
+    }
+
+    *rows = ap_config_cache.valid ? ap_config_cache.rows : 0;
+
+    return ap_config_cache.entries;
+  }
+
+  if (!ap_config_cache.valid || !stat_identity_same(&st, &ap_config_cache.stat)) {
+    size_t parsed = ap_read_package_config(ap_config_cache.entries, AP_MAX_ROWS);
+
+    ap_config_cache.stat = st;
+    ap_config_cache.rows = parsed;
+    ap_config_cache.valid = true;
+
+    LOGI("Parsed %zu APatch package rows", parsed);
+  }
+
+  *rows = ap_config_cache.rows;
+
+  return ap_config_cache.entries;
+}
+
+/* INFO: A row is addressed by its uid and nothing else. APatch writes the full
+         uid - a work profile's row carries that profile's own user offset - and
+         the kernel's allowlist is keyed the same way, so any wider comparison here
+         would answer about a process the kernel never ruled on. */
+static bool ap_row_matches(const struct ap_package_entry *entry, uid_t uid) {
+  return uid == entry->uid;
+}
+
+void ap_get_existence(struct root_impl_state *state) {
+  /* INFO: The apd binary and the package configuration are the two things the
+           daemon depends on. The APatch Manager runs its own version gate at
+           install time, so checking presence here is enough; spawning apd to
+           parse "-V" would only add a dependency on its SELinux domain. */
+  if (access(AP_BIN_DIR, F_OK) == -1 || access(AP_CONFIG_FILE, F_OK) == -1) {
+    LOGI("APatch not found (missing %s or %s).", AP_BIN_DIR, AP_CONFIG_FILE);
+
+    state->state = Inexistent;
+
+    return;
+  }
+
+  state->state = Supported;
+}
+
+/* INFO: Both flags come out of one cached-rows pass: GetProcessFlags asks
+         for the pair on every fork, and ap_get_config_rows stats the config
+         once here instead of once per flag. */
+void ap_uid_query_root(uid_t uid, bool *granted_root, bool *should_umount) {
+  *granted_root = false;
+  *should_umount = false;
+
+  size_t rows = 0;
+  struct ap_package_entry *entries = ap_get_config_rows(&rows);
+
+  for (size_t i = 0; i < rows; i++) {
+    if (!ap_row_matches(&entries[i], uid)) continue;
+
+    if (entries[i].allow) *granted_root = true;
+    if (entries[i].exclude) *should_umount = true;
+
+    if (*granted_root && *should_umount) break;
+  }
+}
+
+/* INFO: The manager may be installed for any user profile, so both /data/user
+         and /data/user_de are scanned (the device owner's profile lives at
+         /data/user/0). FolkPatch keeps the layout but ships its manager under
+         me.yuki.folk.
+
+         Unlike KernelSU there is no manager marker to read, so this walks
+         directories - and a walk that never ran must not be read as "not the
+         manager": that answer sends the process down the denylist path, where
+         the module tree is reverted out of its own namespace and every WebUI it
+         opens renders blank. */
+static enum uid_manager_state ap_scan_base_for_manager(const char *base, uid_t uid) {
+  DIR *dir = opendir(base);
+  if (dir == NULL) return UID_MANAGER_UNKNOWN;
+
+  static const char *const manager_pkgs[] = { AP_MANAGER_PKG, AP_FOLKPATCH_PKG };
+
+  struct dirent *entry;
+  bool found = false;
+
+  while (!found && (entry = readdir(dir)) != NULL) {
+    /* INFO: DT_UNKNOWN says the filesystem did not classify the entry, not that
+             it is not a directory; the stat below is what decides, so those
+             entries cannot be dropped here. */
+    if (entry->d_type != DT_UNKNOWN && entry->d_type != DT_DIR) continue;
+    if (entry->d_name[0] == '.') continue;
+
+    /* INFO: Every path here is far below PATH_MAX, but gcc cannot see that
+             through the two-level snprintf and would flag it; an entry that
+             actually overflows is not one worth probing anyway. */
+    char user_dir[PATH_MAX];
+    if (snprintf(user_dir, sizeof(user_dir), "%s/%s", base, entry->d_name) >= PATH_MAX) continue;
+
+    for (size_t i = 0; i < sizeof(manager_pkgs) / sizeof(manager_pkgs[0]); i++) {
+      char manager_dir[PATH_MAX];
+      if (snprintf(manager_dir, sizeof(manager_dir), "%s/%s", user_dir, manager_pkgs[i]) >= PATH_MAX) continue;
+
+      struct stat st;
+      if (stat(manager_dir, &st) == 0 && st.st_uid == uid) {
+        found = true;
+
+        break;
+      }
+    }
+  }
+
+  closedir(dir);
+
+  return found ? UID_MANAGER_YES : UID_MANAGER_NO;
+}
+
+/* INFO: Only a base that was read and came back empty is evidence; one that
+         could not be opened leaves the pair's answer open. */
+static enum uid_manager_state ap_find_manager(uid_t uid) {
+  static const char *const bases[] = { "/data/user_de", "/data/user" };
+
+  enum uid_manager_state result = UID_MANAGER_NO;
+
+  for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+    enum uid_manager_state base_result = ap_scan_base_for_manager(bases[i], uid);
+
+    if (base_result == UID_MANAGER_YES) return UID_MANAGER_YES;
+
+    if (base_result == UID_MANAGER_UNKNOWN) result = UID_MANAGER_UNKNOWN;
+  }
+
+  return result;
+}
+
+/* INFO: The manager scan stats its way through /data/user and /data/user_de,
+         which is too much work for every fork. Results are cached per uid in
+         a single slot with a short window: a freshly installed manager is
+         picked up within seconds, while bursts of forks of the same app pay
+         for one scan instead of one per process. */
+#define AP_MANAGER_CACHE_SECS 5
+
+enum uid_manager_state ap_uid_is_manager(uid_t uid) {
+  static uid_t cached_uid = 0;
+  static enum uid_manager_state cached_result = UID_MANAGER_NO;
+  static bool cached_valid = false;
+  static struct timespec cached_at = { 0 };
+
+  /* INFO: Zeroed so a failing clock_gettime() cannot feed an uninitialised
+            value into the age comparison below. */
+  struct timespec now = { 0 };
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  bool fresh = cached_valid &&
+               (now.tv_sec - cached_at.tv_sec) < AP_MANAGER_CACHE_SECS;
+
+  if (fresh && cached_uid == uid) return cached_result;
+
+  enum uid_manager_state result = ap_find_manager(uid);
+
+  /* INFO: Not cached: this answer means /data was unreadable at this moment -
+             the boot before the first unlock, most of the time - and the next
+             fork should ask again rather than inherit it for the whole window. */
+  if (result == UID_MANAGER_UNKNOWN) return result;
+
+  cached_uid = uid;
+  cached_result = result;
+  cached_valid = true;
+  cached_at = now;
+
+  return result;
+}

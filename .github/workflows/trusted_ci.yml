@@ -1,0 +1,426 @@
+name: Trusted CI
+
+on:
+  push:
+    branches: [ main ]
+
+  # INFO: The same jobs, asked for by hand. A push is the normal way in, but
+  #       until now it was the only way in - so when GitHub does not schedule
+  #       the push event, or a run is worth repeating against the very same
+  #       tree without another commit on top of it, nothing could be done from
+  #       outside but push an empty one.
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Host unit tests
+    # INFO: Same pinned image as every other job here, so the suite runs on the
+    #       OS release main will judge it by, not on wherever -latest points.
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        # INFO: In-tree sources only (the ELF reader, the mountinfo and APatch
+        #       parsers): no submodules, no history. Keeping this job separate
+        #       lets a broken test fail fast without costing the archives.
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      # INFO: The suite builds the tools itself, so this job needs the toolchain
+      #       too - the same one the build job uses.
+      - name: Setup Rust
+        run: rustup default "${RUST_TOOLCHAIN:-stable}"
+
+      - name: Host unit tests
+        # INFO: Shared with the Untrusted CI through tests/host/run.sh, so a
+        #       pull request is judged by the very same commands that run here
+        #       after the merge.
+        run: bash tests/host/run.sh
+
+  build:
+    # INFO: Same pinned image as ci.yml - see there for why not -latest.
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Setup keys
+        env:
+          private_key: ${{ secrets.ORG_PRIVATE_KEY }}
+          public_key: ${{ secrets.ORG_PUBLIC_KEY }}
+        run: |
+          # INFO: Without the keys the build selects its unsigned flavour, and
+          #       that flavour still creates the signature files - empty ones -
+          #       so a missing secret used to produce a green run whose archives
+          #       only looked signed. A repository may legitimately not sign, so
+          #       this is a warning rather than a failure; what it may not be is
+          #       unmentioned.
+          if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+            echo "::warning::ORG_PRIVATE_KEY / ORG_PUBLIC_KEY are not configured; this build will be UNSIGNED"
+            exit 0
+          fi
+
+          # INFO: A key that is present but does not decode is a different
+          #       thing: the secret exists and is wrong, and the build would go
+          #       on to produce an unsigned archive out of it.
+          if ! printf '%s' "$private_key" | base64 -d > module/private_key 2>/dev/null || [ ! -s module/private_key ]; then
+            echo "::error::ORG_PRIVATE_KEY is set but does not decode into a usable key"
+            exit 1
+          fi
+
+          if ! printf '%s' "$public_key" | base64 -d > module/public_key 2>/dev/null || [ ! -s module/public_key ]; then
+            echo "::error::ORG_PUBLIC_KEY is set but does not decode into a usable key"
+            exit 1
+          fi
+
+          echo "Signing keys installed"
+
+      - name: Setup NDK_PATH
+        # INFO: NDK_VERSION in common.mk names the toolchain this build is meant
+        #       to use, and NDK_PATH was being overridden with
+        #       ANDROID_NDK_LATEST_HOME - so the pin never took effect and the
+        #       build ran on whatever "-latest" happened to be that week. The
+        #       pinned release is used when the runner has it. When it does not,
+        #       the run continues on the newest one it does have, and says so:
+        #       swapping the toolchain silently is the thing this step exists to
+        #       stop, not a hard failure nobody asked for.
+        run: |
+          set -euo pipefail
+
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$sdk" ]; then
+            echo "::error::Neither ANDROID_SDK_ROOT nor ANDROID_HOME is set"
+            exit 1
+          fi
+
+          pinned=$(sed -n 's/^NDK_VERSION ?= *//p' common.mk)
+          if [ -z "$pinned" ]; then
+            echo "::error::NDK_VERSION is not pinned in common.mk"
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+          if [ -d "$sdk/ndk/$pinned" ]; then
+            echo "Using the pinned NDK $pinned"
+            exit 0
+          fi
+
+          newest=$(ls -1 "$sdk/ndk" 2>/dev/null | sort -V | tail -1)
+          if [ -z "$newest" ]; then
+            echo "::error::No NDK is installed under $sdk/ndk"
+            exit 1
+          fi
+
+          echo "::warning::The pinned NDK $pinned is not installed; building on $newest instead (installed: $(ls "$sdk/ndk" | tr '\n' ' '))"
+          echo "NDK_VERSION=$newest" >> "$GITHUB_ENV"
+
+      # INFO: The packaging tools are Rust, and `make` calls the signer, so they
+      #       have to exist before the build.
+      - name: Setup Rust
+        run: |
+          rustup default "${RUST_TOOLCHAIN:-stable}"
+          rustc --version
+          cargo --version
+
+          # INFO: The loader links a `no_std` staticlib built by cargo
+          #       (rust/vexcore), and building it is this job - the device
+          #       target has to be installed here, not only in the
+          #       rust-android job that measures it.
+          rustup target add aarch64-linux-android
+
+      - name: Build the tools
+        run: make -C tools build-host
+
+      - name: Tool unit tests
+        # INFO: The signer pins the exact bytes it feeds Ed25519, which is the
+        #       one thing a release cannot get wrong by compiling.
+        run: make -C tools test-host
+
+      - name: Build
+        run: |
+          make all -j$(nproc)
+          make apatch -j$(nproc)
+          make apatch-debug -j$(nproc)
+
+      - name: Binary size budget
+        run: tools/target/release/ci-size-budget build build-apatch
+
+      - name: Verify the builds are signed
+        # INFO: The build selects its unsigned flavour whenever the keys are
+        #       absent, and that flavour still creates the signature files - so
+        #       their presence proves nothing. A real Ed25519 signature followed
+        #       by the public key is 96 bytes; the placeholder is zero. When a
+        #       key was installed the archives must carry one, on every variant.
+        run: |
+          set -euo pipefail
+
+          if [ ! -s module/private_key ]; then
+            echo "::warning::No signing key in this run, so the archives are unsigned"
+            ls -l build/module/*/misaki.sig build-apatch/module/*/misaki.sig 2>/dev/null || true
+            exit 0
+          fi
+
+          status=0
+          for sig in build/module/*/machikado.arm64 build/module/*/misaki.sig \
+                     build-apatch/module/*/machikado.arm64 build-apatch/module/*/misaki.sig; do
+            if [ ! -f "$sig" ]; then
+              echo "::error::$sig was never produced"
+              status=1
+              continue
+            fi
+
+            size=$(stat -c%s "$sig")
+            if [ "$size" -lt 96 ]; then
+              echo "::error::$sig is $size bytes - the build is not signed"
+              status=1
+            fi
+          done
+
+          [ "$status" -eq 0 ] && echo "All signature files carry a signature"
+          exit $status
+
+      - name: Check the published update channel
+        # INFO: module.prop points the KernelSU manager at update.json on main,
+        #       and a zipUrl that names an archive its release does not hold
+        #       fails silently - the file itself looks fine in the repository,
+        #       and only the device notices. It has drifted before: the channel
+        #       named build 768 while the release held 770.
+        #
+        #       update-apatch.json is checked too. It named an archive the
+        #       v2.2.0 release had never been given - the APatch flavour was
+        #       built and archived by CI, but only the KernelSU archives were
+        #       attached to the release - so the channel answered 404 to every
+        #       device that read it. The archives are attached now, which is
+        #       what this check is here to keep true.
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+          import urllib.error
+          import urllib.request
+
+          failed = False
+
+          for path in ("update.json", "update-apatch.json"):
+              with open(path, encoding="utf-8") as file:
+                  channel = json.load(file)
+
+              url = channel["zipUrl"]
+
+              try:
+                  status = urllib.request.urlopen(
+                      urllib.request.Request(url, method="HEAD"), timeout=30).status
+              except urllib.error.HTTPError as error:
+                  status = error.code
+              except Exception as error:
+                  status = f"{type(error).__name__}: {error}"
+
+              if status != 200:
+                  print(f"::error::{path} names {url}, which answers {status}")
+                  failed = True
+              else:
+                  print(f"{path}: {url} -> {status}")
+
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Generate update.json
+        run: |
+          tools/target/release/make-update-json --tree build --output build/out/update.json --pattern "VexZygisk-v*-release.zip"
+          tools/target/release/make-update-json --tree build-apatch --output build-apatch/out/update-apatch.json --pattern "VexZygisk-APatch-v*-release.zip"
+
+      - name: Upload update.json
+        uses: actions/upload-artifact@v7
+        with:
+          name: update.json
+          path: "build/out/update.json"
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload APatch update.json
+        uses: actions/upload-artifact@v7
+        with:
+          name: update-apatch.json
+          path: "build-apatch/out/update-apatch.json"
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload release
+        uses: actions/upload-artifact@v7
+        with:
+          path: "build/out/VexZygisk-v*-release.zip"
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload APatch release
+        uses: actions/upload-artifact@v7
+        with:
+          path: "build-apatch/out/VexZygisk-APatch-v*-release.zip"
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload debug
+        uses: actions/upload-artifact@v7
+        with:
+          path: "build/out/VexZygisk-v*-debug.zip"
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload APatch debug
+        uses: actions/upload-artifact@v7
+        with:
+          path: "build-apatch/out/VexZygisk-APatch-v*-debug.zip"
+          archive: false
+          if-no-files-found: error
+
+      - name: Publish artifacts to Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_THREAD_ID: ${{ secrets.TG_THREAD_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # INFO: The bot exists only once its secrets do; until then this is
+          #       a warning and the artifacts stay on the run page alone.
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "::warning::Telegram secrets not configured, skipping publish"
+            exit 0
+          fi
+
+          zips=$(ls build/out/VexZygisk-v*-release.zip build/out/VexZygisk-v*-debug.zip \
+                     build-apatch/out/VexZygisk-APatch-v*-release.zip \
+                     build-apatch/out/VexZygisk-APatch-v*-debug.zip 2>/dev/null || true)
+          if [ -z "$zips" ]; then
+            echo "::error::No build zips found in build/out and build-apatch/out"
+            exit 1
+          fi
+
+          escape_html() {
+            sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+          }
+
+          COMMIT_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$COMMIT_SHA"
+
+          # INFO: The commit message quoted whole, the way the channel shows
+          #       it, cut by characters (not bytes) and far enough ahead of
+          #       Telegram's 1024-character caption limit that the escaping
+          #       of the text below cannot push the caption over it.
+          message=$(git log -1 --pretty=%B "$COMMIT_SHA" \
+            | python3 -c "import sys; sys.stdout.write(sys.stdin.read().strip()[:600])" \
+            | escape_html)
+
+          echo "publishing from $(pwd)"
+          ls -la build/out/ build-apatch/out/
+
+          # INFO: Every zip of the build travels as ONE media group - a single
+          #       message, one caption on its first item, the shape a channel
+          #       reader expects a build to arrive in.
+          count=0
+          doc_args=()
+          for zip in $zips; do
+            doc_args+=(-F "doc$count=@$GITHUB_WORKSPACE/$zip")
+            count=$((count + 1))
+          done
+
+          # INFO: The media list is written to a file by the interpreter and
+          #       handed to curl with the "read the value from this file"
+          #       form, because an inline JSON in the form value does not
+          #       survive the field parser - Telegram answered every inline
+          #       attempt with "can't parse media JSON object", while the
+          #       identical JSON through a file parses and ships.
+          CAPTION="<b>VexZygisk</b>"$'\n'"Run: #ci_$RUN_NUMBER"$'\n\n'"<blockquote>$message</blockquote>"$'\n\n'"<a href=\"$COMMIT_URL\">Commit</a>"$'\n'"<a href=\"$RUN_URL\">Workflow run</a>" \
+            python3 -c 'import json, sys, os; n = int(sys.argv[1]); m = [{"type": "document", "media": "attach://doc%d" % i} for i in range(n)]; m[-1]["caption"] = os.environ["CAPTION"]; m[-1]["parse_mode"] = "HTML"; open(sys.argv[2], "w").write(json.dumps(m))' "$count" "$GITHUB_WORKSPACE/tg_media.json"
+
+          curl_args=(-sS -o tg_response.json -w '%{http_code}'
+                     --form-string "chat_id=$TG_CHAT_ID"
+                     -F 'media=<tg_media.json'
+                     "${doc_args[@]}")
+
+          if [ -n "$TG_THREAD_ID" ]; then
+            curl_args+=(--form-string "message_thread_id=$TG_THREAD_ID")
+          fi
+
+          curl_args+=("https://api.telegram.org/bot$TG_BOT_TOKEN/sendMediaGroup")
+
+          # INFO: A Telegram hiccup must not fail a build that already
+          #       produced its artifacts: warn and keep the delivery to the
+          #       next run instead of failing the build over it.
+          http=$(curl "${curl_args[@]}" 2>curl_err.txt) || http="curl-failed"
+
+          if [ "$http" != "200" ]; then
+            echo "::warning::Telegram upload failed ($http)"
+            [ -s curl_err.txt ] && echo "::warning::curl: $(cat curl_err.txt)"
+            [ -s tg_response.json ] && echo "::warning::Telegram said: $(head -c 400 tg_response.json)"
+          else
+            echo "Sent $count zips as one media group: $(head -c 160 tg_response.json)"
+          fi
+
+  rust-android:
+    # INFO: The Rust that runs on a device is compiled here, and only here.
+    #       `zygisk-ptrace64` carries an `android` feature that no build turned
+    #       on, so it sat in the tree uncompiled until it stopped compiling at
+    #       all - a doc comment where one is not allowed, and a call to
+    #       `zeroed()` that had stopped being accepted outside an `unsafe`
+    #       block. The same step measures what `std` costs on this target, so
+    #       whether another module can be Rust is a number from the toolchain
+    #       the release is built with instead of an opinion.
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # INFO: No submodules: nothing here compiles the engines, and the
+          #       probe bins pull in no dependency of their own.
+          fetch-depth: 1
+
+      - name: Setup NDK_PATH
+        # INFO: Same resolution and the same fallback as the build job - the
+        #       version is pinned in common.mk, and a runner that does not have
+        #       that one measures on the newest it does have, out loud. This job
+        #       needs the NDK for its linker, its size tool and its stripper.
+        run: |
+          set -euo pipefail
+
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [ -z "$sdk" ]; then
+            echo "::error::Neither ANDROID_SDK_ROOT nor ANDROID_HOME is set"
+            exit 1
+          fi
+
+          pinned=$(sed -n 's/^NDK_VERSION ?= *//p' common.mk)
+          if [ -z "$pinned" ]; then
+            echo "::error::NDK_VERSION is not pinned in common.mk"
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+          if [ -d "$sdk/ndk/$pinned" ]; then
+            echo "Using the pinned NDK $pinned"
+            exit 0
+          fi
+
+          newest=$(ls -1 "$sdk/ndk" 2>/dev/null | sort -V | tail -1)
+          if [ -z "$newest" ]; then
+            echo "::error::No NDK is installed under $sdk/ndk"
+            exit 1
+          fi
+
+          echo "::warning::The pinned NDK $pinned is not installed; measuring on $newest instead (installed: $(ls "$sdk/ndk" | tr '\n' ' '))"
+          echo "NDK_VERSION=$newest" >> "$GITHUB_ENV"
+
+      - name: Setup Rust
+        run: |
+          rustup default "${RUST_TOOLCHAIN:-stable}"
+          rustc --version
+
+      - name: Device-side Rust compiles, and what std costs there
+        run: bash tools/device-target.sh

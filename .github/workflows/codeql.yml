@@ -1,0 +1,72 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # INFO: A weekly sweep even when nothing is pushed, so a new advisory
+    #       against an unchanged dependency still surfaces.
+    - cron: "0 3 * * 1"
+
+# INFO: Deliberately no pull_request trigger, and it is not an oversight. On a
+#       pull request the action switches to its overlay/TRAP-cache path, which
+#       it warns "Cannot build an overlay database because build-mode is set to
+#       'autobuild' instead of 'none'" for - so it falls back to a full
+#       database while still keeping the TRAP cache read-only, extracts nothing
+#       and fails the job with "could not process any code written in C/C++".
+#       That is not a first-run artifact: the overlay database is only ever
+#       saved when overlay mode was actually used, so a pull request can never
+#       find one to seed from. The default branch analysis below is what works,
+#       and a pull request is already compiled and tested by the two CI
+#       workflows; anything merged is scanned here immediately afterwards.
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    # INFO: Pinned rather than ubuntu-latest, so this moves to 26.04 when the
+    #       rest of the CI does.
+    runs-on: ubuntu-26.04
+
+    permissions:
+      # INFO: Required by the analysis job: read the code, and let the CodeQL
+      #       action write the results back as code-scanning alerts.
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ c-cpp, actions, python ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # INFO: The C/C++ build reads the submodules, exactly as the two CI
+          #       workflows do; without them autobuild has nothing to compile.
+          submodules: ${{ matrix.language == 'c-cpp' && 'recursive' || 'false' }}
+
+      # INFO: Autobuild runs this repository's own make, and common.mk points
+      #       the toolchain at $(HOME)/Android/Sdk/ndk/<pinned>, which this
+      #       image does not carry. The build jobs in ci.yml and trusted_ci.yml
+      #       resolve the pinned version from common.mk first and fall back with
+      #       a warning; this one only needs some compiler for autobuild to
+      #       observe, so it points NDK_PATH straight at the newest NDK the
+      #       image has.
+      - name: Setup NDK_PATH
+        if: matrix.language == 'c-cpp'
+        run: echo "NDK_PATH=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
+
+      # INFO: C/C++ needs a build to be observed, so let autobuild run the
+      #       repository's make under tracing; the Python and Actions
+      #       analyses do not build at all.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.language == 'c-cpp' && 'autobuild' || 'none' }}
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"

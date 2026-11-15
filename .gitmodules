@@ -1,0 +1,9 @@
+[submodule "PLTI"]
+	path = loader/src/external/plti
+	url = https://github.com/PerformanC/PLTI
+[submodule "CSOLoader"]
+	path = loader/src/external/csoloader
+	url = https://github.com/ThePedroo/CSOLoader
+[submodule "LSPlt"]
+	path = loader/src/external/lsplt
+	url = https://github.com/Anatdx/LSPlt.git

@@ -1,0 +1,199 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+#include <dlfcn.h>
+#include <signal.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include <linux/limits.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#define LOG_TAG "zygiskd-companion"
+
+#include "utils.h"
+
+typedef void (*zygisk_companion_entry)(int);
+
+struct companion_module_thread_args {
+  int fd;
+  zygisk_companion_entry entry;
+};
+
+zygisk_companion_entry load_module(int fd) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+
+  void *handle = dlopen(path, RTLD_NOW);
+  if (!handle) {
+    LOGE("Failed to dlopen module: %s", dlerror());
+
+    return NULL;
+  }
+
+  void *entry = dlsym(handle, "zygisk_companion_entry");
+  if (!entry) {
+    LOGE("Failed to dlsym zygisk_companion_entry: %s", dlerror());
+
+    dlclose(handle);
+
+    return NULL;
+  }
+
+  return (zygisk_companion_entry)entry;
+}
+
+void *entry_thread(void *arg) {
+  struct companion_module_thread_args *args = (struct companion_module_thread_args *)arg;
+
+  int fd = args->fd;
+  zygisk_companion_entry module_entry = args->entry;
+
+  struct stat st0 = { 0 };
+  if (fstat(fd, &st0) == -1) {
+    LOGE(" - Failed to get initial client fd stats: %s", strerror(errno));
+
+    /* INFO: This thread owns the client fd and closes it at the end of a
+              successful run. Leaving it open here leaks one descriptor per
+              failure, in a process that lives as long as the daemon does. */
+    close(fd);
+
+    free(args);
+
+    return NULL;
+  }
+
+  module_entry(fd);
+
+  /* INFO: Only attempt to close the client fd if it appears to be the same file
+             and if we can successfully stat it again. This prevents double closes
+             if the module companion already closed the fd. Comparing the device
+             alongside the inode keeps an unrelated fd that was reused for a file
+             with the same inode number on another filesystem from passing.
+  */
+  struct stat st1;
+  if (fstat(fd, &st1) != -1 && st0.st_dev == st1.st_dev && st0.st_ino == st1.st_ino &&
+      ((st0.st_mode ^ st1.st_mode) & S_IFMT) == 0) {
+    LOGI(" - Client fd unchanged after module entry, closing it");
+
+    close(fd);
+  }
+
+  free(args);
+
+  return NULL;
+}
+
+void companion_entry(int fd) {
+  /* INFO: Installed before the first write. A peer that has already gone away
+            turns a write into SIGPIPE, whose default action kills the process
+            instead of letting the error paths below run. */
+  struct sigaction sa = { .sa_handler = SIG_IGN };
+  sigaction(SIGPIPE, &sa, NULL);
+
+  LOGI("New companion entry.\n - Client fd: %d\n", fd);
+
+  char name[PROCESS_NAME_MAX_LEN];
+  ssize_t ret = read_string(fd, name, sizeof(name));
+  if (ret == -1) {
+    LOGE("Failed to read module name");
+
+    goto cleanup;
+  }
+
+  LOGI(" - Module name: \"%s\"", name);
+
+  int library_fd = read_fd(fd);
+  if (library_fd == -1) {
+    LOGE("Failed to receive library fd");
+
+    goto cleanup;
+  }
+
+  LOGI(" - Library fd: %d", library_fd);
+
+  zygisk_companion_entry module_entry = load_module(library_fd);
+  close(library_fd);
+
+  if (module_entry == NULL) {
+    LOGE(" - No companion module entry for module: %s", name);
+
+    ret = write_uint8_t(fd, 0);
+    ASSURE_SIZE_WRITE("ZygiskdCompanion", "module_entry", ret, sizeof(uint8_t), goto cleanup);
+
+    goto cleanup;
+  } else {
+    LOGI(" - Module entry found");
+
+    ret = write_uint8_t(fd, 1);
+    ASSURE_SIZE_WRITE("ZygiskdCompanion", "module_entry", ret, sizeof(uint8_t), goto cleanup);
+  }
+
+  while (1) {
+    if (!check_unix_socket(fd, true)) {
+      LOGE("Something went wrong in companion. Bye!");
+
+      break;
+    }
+
+    int client_fd = read_fd(fd);
+    if (client_fd == -1) {
+      LOGE("Failed to receive client fd");
+
+      break;
+    }
+
+    struct companion_module_thread_args *args = malloc(sizeof(struct companion_module_thread_args));
+    if (args == NULL) {
+      LOGE("Failed to allocate memory for thread args");
+
+      close(client_fd);
+
+      break;
+    }
+
+    args->fd = client_fd;
+    args->entry = module_entry;
+
+    LOGI("New companion request.\n - Module name: %s\n - Client fd: %d\n", name, client_fd);
+
+    ret = write_uint8_t(client_fd, 1);
+    if (ret != sizeof(uint8_t)) {
+      LOGE("Failed to send client_fd in ZygiskdCompanion: Expected %zu, got %zd", sizeof(uint8_t), ret);
+
+      /* INFO: One client that went away before its hand-off completed is
+                that client's failure: the control socket is still fine, and
+                ending the companion here would drop service for every other
+                client of this module until the daemon notices and respawns.
+                The daemon-side holder decides when the control socket is
+                done - the checks at the top of this loop. */
+      free(args);
+      close(client_fd);
+
+      continue;
+    }
+
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, entry_thread, (void *)args) != 0) {
+      LOGE(" - Failed to create thread for companion module");
+
+      close(client_fd);
+      free(args);
+
+      /* INFO: One failed spawn should not tear down the companion for every
+                later client; keep serving. */
+      continue;
+    }
+
+    pthread_detach(thread);
+  }
+
+  cleanup:
+    close(fd);
+    LOGE("Companion thread exited");
+
+    exit(0);
+}

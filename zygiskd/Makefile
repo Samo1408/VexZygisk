@@ -1,0 +1,73 @@
+ROOT_DIR := ..
+include ../common.mk
+
+# INFO: common.mk carries the rule that builds the Rust archive, and a rule is
+#       what decides the default goal: make takes the first target of the first
+#       rule it read, and an include is read before the rest of this file. So
+#       without this line `make -C zygiskd` would build libvexcore.a and stop,
+#       and the packaging step would then look for the daemon it never got.
+#
+#       The goal is the one this Makefile has always defaulted to.
+.DEFAULT_GOAL := all
+OBJ_ROOT = $(BUILD_DIR)/obj/$(BUILD_TYPE)/zygiskd
+OBJ_DIR = $(OBJ_ROOT)/$(ARCH)
+
+ZKSU_VERSION ?= $(VER_NAME)
+
+ifeq ($(BUILD_TYPE),release)
+	TYPE_CFLAGS = -O3 -flto -DNDEBUG
+	TYPE_LDFLAGS = -Wl,--strip-all -flto
+else
+	TYPE_CFLAGS = -g -O0 -DDEBUG
+	TYPE_LDFLAGS =
+endif
+
+# INFO: One function per section, and one section per datum, so the linker can
+#       drop what nothing reaches. The daemon links the Rust archive the loader
+#       links (common.mk), and it uses exactly one symbol out of it - the
+#       zn_modules.txt line parser. Without these the archive arrives as one
+#       piece per codegen unit, and a link that has to keep a whole object file
+#       because it needs one function out of it kept all of them: the daemon went
+#       from 34 KiB to 238 KiB, past its 56 KiB budget, while the loader - which
+#       has had these two flags and --gc-sections all along - grew by 5.
+TYPE_CFLAGS += -ffunction-sections -fdata-sections
+TYPE_LDFLAGS += -Wl,--gc-sections
+
+ZYGISKD_CFLAGS = -D_GNU_SOURCE -std=c99 -Wpedantic -Wall -Wextra -Werror  \
+			 	 -Wformat -Wuninitialized -Wshadow -Wno-zero-length-array \
+			 	 -Wno-unknown-warning-option -Wconversion                 \
+			 	 $(ROOT_IMPL_DEF)                                         \
+			 	 '-DZKSU_VERSION="$(ZKSU_VERSION)"'
+
+ROOT_IMPL_SRC = $(if $(filter apatch,$(ROOT_IMPL)),src/root_impl/apatch.c,src/root_impl/kernelsu.c)
+
+SRCS = src/root_impl/common.c $(ROOT_IMPL_SRC) \
+	   src/companion.c src/main.c src/utils.c src/zygiskd.c src/zn_companion.c \
+	   src/zn_status.c
+
+OBJS = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(SRCS))
+BIN = $(OBJ_DIR)/zygiskd
+
+# INFO: The Zygisk Next module contract lives with the loader, the daemon hosts
+#       the companion side of it and must follow the very same layout.
+INCLUDES = -Isrc -Isrc/root_impl -I../loader/src/include
+
+.PHONY: all arch clean
+
+all: arch
+	@mkdir -p $(OBJ_ROOT)
+	@touch $(OBJ_ROOT)/.done
+
+arch: $(BIN)
+
+clean:
+	rm -rf $(BUILD_DIR)/obj/$(BUILD_TYPE)/zygiskd
+	rm -rf $(BUILD_DIR)/obj/$(BUILD_TYPE)/vexcore-target
+
+$(OBJ_DIR)/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC_ARCH) $(ZYGISKD_CFLAGS) $(TYPE_CFLAGS) $(INCLUDES) -c $< -o $@
+
+$(BIN): $(OBJS) $(VEXCORE_LIB)
+	@mkdir -p $(dir $@)
+	$(CC_ARCH) $(TYPE_LDFLAGS) $(OBJS) $(VEXCORE_LIB) -llog -o $@
